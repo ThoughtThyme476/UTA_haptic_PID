@@ -1,0 +1,133 @@
+//testing out the encoder
+#include <Encoder.h> //this lets the compiler know we are using the "Encoder" library in this script
+#define ENCODER_OPTIMIZE_INTERRUPTS //lets us use hardware interrupts to stay on top of where encoder is at
+const int encA = 2;
+const int encB = 3;
+const int MotIn1 = 5; 
+const int MotIn2 = 4; 
+const int pwm = 9;
+
+Encoder myEncoder (encA, encB);
+long position = 0; //this will show us the encoder ticks
+const int RadOfRoto = 5;
+const int Radofsect = 75;
+const int AxisofRotoHandle = 85;
+double RotoGet = myEncoder.read();
+float currentPos = RotoGet * (RadOfRoto / AxisofRotoHandle);
+
+
+double vKp;
+double vKi;
+double vKd;
+float error; //annount from target 
+double prevError;
+int intergral; 
+int derivative;
+int time2 = 0;
+double power;
+
+
+void setConstants( double kp, double ki, double kd){
+    vKp = kp;
+    vKi = ki;
+    vKd = kd;
+    }
+
+double calcPID(double target, double input, int integralKi, int maxIntergral){ //basically tuning i here
+    int intergal;
+
+    prevError = error;
+    error = target - input;
+
+    if(abs(error) < integralKi) {
+        intergral += error; 
+    } else {
+        intergral = 0;
+    }
+if(intergral >= 0){
+    intergral = min(intergral, maxIntergral); //min means take whichever value is smaller bwtween intergral and maxI
+} else {
+    intergral = max(intergral, -maxIntergral);//negative max
+}
+    derivative = error - prevError;
+
+   power = (vKp * error) + (vKi * intergral) + (vKd * derivative);
+
+
+    return power;
+}
+
+void moveMotor(double motorPower) {
+    // Constrain power to valid PWM range
+    int pwmVal = constrain(abs(motorPower), 0, 255);
+
+    if (motorPower > 0) {
+        // Spin Forward
+        digitalWrite(MotIn1, HIGH);
+        digitalWrite(MotIn2, LOW);
+    } else if (motorPower < 0) {
+        // Spin Backward
+        digitalWrite(MotIn1, LOW);
+        digitalWrite(MotIn2, HIGH);
+    } else {
+        // Stop
+        digitalWrite(MotIn1, LOW);
+        digitalWrite(MotIn2, LOW);
+        pwmVal = 0;
+    }
+
+    // Send speed to the PWM pin
+    analogWrite(pwm, pwmVal);
+}
+
+
+
+void setup() {
+// put your setup code here, to run once:
+Serial.begin(115200); //begin serial communication
+pinMode(MotIn1, OUTPUT); //all caps because it's a predefined constant/macro
+pinMode(MotIn2, OUTPUT);
+pinMode(pwm, OUTPUT);
+setConstants(4,0,6);
+}
+// void loop() {
+// // put your main code here, to run repeatedly:
+// // position = myEncoder.read();
+// // Serial.print("Counts: ");
+// // Serial.println(position);
+// // Serial.println("CurrentPos (mm rotated from center)");
+// // Serial.print(currentPos);
+// // delay(250);
+
+// calcPID(0, myEncoder.read(), 0, 0);
+// if (power >= 255) power = 255;
+// if (power <= -255) power = -255;
+
+
+// }
+
+void loop() {
+    // 1. Define a target position (for testing, let's say 1000 encoder counts)
+    double targetPosition = 0.0; 
+
+    // 2. Read the current encoder position
+    double currentPosition = myEncoder.read();
+
+    // 3. Compute PID output (passing target, input, integral threshold, max integral)
+    // Make sure to initialize your constants using setConstants() in setup() first!
+    calcPID(targetPosition, currentPosition, 50, 200);
+
+    // 4. Send the calculated power to the motor
+    moveMotor(power);
+
+    // Optional: Print to Serial Monitor for debugging
+    Serial.print("Target: ");
+    Serial.print(targetPosition);
+    Serial.print(" | Current: ");
+    Serial.print(currentPosition);
+    Serial.print(" | Power: ");
+    Serial.println(power);
+
+    // Small delay to keep serial readable (though PID loops prefer consistent timing)
+    delay(10); 
+}
