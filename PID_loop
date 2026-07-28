@@ -15,6 +15,8 @@ const int AxisofRotoHandle = 85;
 double RotoGet = myEncoder.read();
 float currentPos = RotoGet * (RadOfRoto / AxisofRotoHandle);
 
+// --- Settle Tolerance Configuration ---
+const double settleTolerance = 5.0; // Stay off if within 5 encoder counts of target
 
 double vKp;
 double vKi;
@@ -38,6 +40,13 @@ double calcPID(double target, double input, int integralKi, int maxIntergral){ /
 
     prevError = error;
     error = target - input;
+
+    // Settle tolerance check: turn off power and clear integral if within range
+    if (abs(error) <= settleTolerance) {
+        intergral = 0;
+        power = 0;
+        return power;
+    }
 
     if(abs(error) < integralKi) {
         intergral += error; 
@@ -88,23 +97,8 @@ Serial.begin(115200); //begin serial communication
 pinMode(MotIn1, OUTPUT); //all caps because it's a predefined constant/macro
 pinMode(MotIn2, OUTPUT);
 pinMode(pwm, OUTPUT);
-setConstants(4,0,6);
+setConstants(1,0,0);
 }
-// void loop() {
-// // put your main code here, to run repeatedly:
-// // position = myEncoder.read();
-// // Serial.print("Counts: ");
-// // Serial.println(position);
-// // Serial.println("CurrentPos (mm rotated from center)");
-// // Serial.print(currentPos);
-// // delay(250);
-
-// calcPID(0, myEncoder.read(), 0, 0);
-// if (power >= 255) power = 255;
-// if (power <= -255) power = -255;
-
-
-// }
 
 void loop() {
     // 1. Define a target position (for testing, let's say 1000 encoder counts)
@@ -115,7 +109,9 @@ void loop() {
 
     // 3. Compute PID output (passing target, input, integral threshold, max integral)
     // Make sure to initialize your constants using setConstants() in setup() first!
-    calcPID(targetPosition, currentPosition, 50, 200);
+    calcPID(targetPosition, currentPosition, 0, 0);
+   if (power >= 255) power = 255;
+   if (power <= -255) power = -255;
 
     // 4. Send the calculated power to the motor
     moveMotor(power);
