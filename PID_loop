@@ -1,139 +1,139 @@
+// Longhorn Hapkit - Day 2, afternoon lab
+// Velocity estimation + velocity-dependent virtual environments.
+//
+// Built on top of PID_loop.ino (spring / wall / hill), with the two changes
+// the afternoon lab asks for:
+//   1. The haptic loop now runs in a Timer2 ISR at a fixed 1 kHz instead of
+//      free-running in loop() with a delay(). A known, constant dt is what
+//      makes velocity estimation possible at all.
+//   2. loop() is now only the serial menu and printing. Serial is far too
+//      slow to live inside a 1 ms ISR.
+//
+// Timer note: Timer2 drives this ISR, so pins 3 and 11 lose analogWrite() and
+// tone() stops working. The motor PWM is on pin 9 (Timer1), so it is unaffected.
+// The encoder interrupts on pins 2/3 are external interrupts, not Timer2, and
+// they are allowed to preempt this ISR -- which is fine, they are very short.
+
 #define ENCODER_OPTIMIZE_INTERRUPTS
 #include <Encoder.h>
 
-const int encA = 2;
-const int encB = 3;
+// ---------------------------------------------------------------- hardware
+const int encA   = 2;
+const int encB   = 3;
 const int MotIn1 = 5;
 const int MotIn2 = 4;
-const int pwm = 9;
+const int pwm    = 9;
 
 Encoder myEncoder(encA, encB);
 
-double vKp;
-double vKi;
-double vKd;
+// ------------------------------------------------------------ loop timing
+// 16,000,000 / (64 * (1 + 249)) = 1000 Hz
+const float dt = 0.001f;   // seconds per haptic loop
 
-double error = 0;
-double prevError = 0;
-double integralAcc = 0;
-double power = 0;
+// float, not double: on the AVR they are the same 32-bit type, but writing
+// float keeps the intent clear and keeps the ISR honest if this ever moves
+// to a board where double really is 64-bit.
 
-double wallError = 0;
-double wallPrevError = 0;
-double wallIntegral = 0;
-unsigned long wallLastTime = 0;
+// ------------------------------------------------------- velocity methods
+enum VelMethod { VEL_RAW = 0, VEL_WINDOW = 1, VEL_LOWPASS = 2 };
 
-const double settleTolerance = 3.0;
+const int WINDOW_N = 10;          // 10 samples @ 1 kHz = 10 ms window
+                                  // slide 17: windows above ~10 ms feel mushy
 
-const double wallSettleTolerance = 1.0;
-const int wallMinPWM = 35;
-const int wallMaxPWM = 255;
+volatile int velMethod = VEL_LOWPASS;
 
-int choose = -1;
+// Low-pass differentiator: v[k] = r*v[k-1] + (1-r)*(x[k]-x[k-1])/dt
+// with r = exp(-2*pi*fc*dt). Computed in loop(), never in the ISR.
+volatile float fc = 20.0f;        // cutoff frequency, Hz (try 1-60)
+volatile float r  = 0.8819f;      // exp(-2*pi*20*0.001)
 
-void setConstants(double kp, double ki, double kd) {
-  vKp = kp;
-  vKi = ki;
-  vKd = kd;
-}
+// ------------------------------------------------------------ shared state
+// Written by the ISR, read by loop(). Multi-byte, so loop() must snapshot
+// them with interrupts off (see readState()).
+volatile long  encCount   = 0;    // raw encoder counts
+volatile float xh         = 0.0f; // handle position (counts)
+volatile float vh         = 0.0f; // handle velocity (counts/s)
+volatile float motorCmd   = 0.0f; // commanded duty, -255..255
 
-void printMenu() {
-  Serial.println();
-  Serial.println("Pick a mode:");
-  Serial.println("0 = spring");
-  Serial.println("1 = wall");
-  Serial.println("2 = hill");
-  Serial.println("Type 0, 1, or 2 and press Send.");
-}
+volatile int  mode        = -1;   // -1 = idle, motor off
+volatile bool pendingReset = false;
 
-void readUserChoice() {
-  if (Serial.available() > 0) {
-    char c = Serial.read();
+// ISR execution time, in Timer2 ticks. Prescaler 64 on a 16 MHz clock means
+// one tick = 4 us, and a full 1 ms period is 250 ticks. Slide 8's warning is
+// only useful if you can check it, so this measures it.
+volatile uint8_t isrTicks     = 0;
+volatile uint8_t isrTicksPeak = 0;
 
-    if (c == '0' || c == '1' || c == '2') {
-      choose = c - '0';
+// Largest |velocity| seen since the last reset. Used by the 'a' auto-tune to
+// figure out what "fast" means on your encoder, so you don't have to.
+volatile float vPeak = 0.0f;
 
-      error = 0;
-      prevError = 0;
-      integralAcc = 0;
+// ----------------------------------------------------------- tunable gains
+// Everything here is in ENCODER COUNTS, not cm -- this sketch keeps the same
+// units your PID_loop.ino used, so your existing spring/wall/hill gains carry
+// over unchanged. That means b is "PWM per (count/sec)" and will be a small
+// number. Watch the printed vh to see the magnitudes your encoder actually
+// produces, then tune b with [ and ].
+volatile float bDamp = 0.05f;     // damping coefficient
 
-      wallError = 0;
-      wallPrevError = 0;
-      wallIntegral = 0;
-      wallLastTime = millis();
+// b is tuned MULTIPLICATIVELY. The useful value depends entirely on your
+// encoder's resolution, so it could plausibly be 0.005 or 5.0 -- stepping by a
+// fixed amount would take a hundred keypresses to cross that. Each press is
+// x1.5, so you can span three orders of magnitude in about 17 presses.
+const float bMul  = 1.5f;
+const float bMin  = 0.0005f;
+const float bMax  = 50.0f;
 
-      Serial.print("Now running mode ");
-      Serial.println(choose);
-    }
-  }
-}
+const float fcStep = 5.0f;        // fc has a known useful range, so additive is fine
 
-double calcPID(double target, double input, double integralKi, double maxIntegral) {
-  prevError = error;
-  error = target - input;
+// spring
+const float kSpring = 4.5f;       // same as your spring mode Kp
 
-  if (abs(error) <= settleTolerance) {
-    integralAcc = 0;
-    return 0.0;
-  }
+// hill
+const float kHill  = 2.0f;
+// Your old hill used Kd*(error - prevError) at ~100 Hz. That term is
+// rate-dependent: moving to 1 kHz would have shrunk it 10x. Since the target
+// is constant, d(error)/dt is exactly -vh, so this is now a true derivative
+// gain. Kd_old(=1.0) * dt_old(=0.01) ~= 0.01 reproduces the old feel.
+const float kdHill = 0.01f;
 
-  if (abs(error) < integralKi) {
-    integralAcc += error;
-  } else {
-    integralAcc = 0;
-  }
+// wall (unchanged from your wall.ino tuning)
+const float wallKp = 5.5f;
+const float wallKi = 0.03f;
+const float wallKd = 0.18f;
+const float wallSettleTolerance = 1.0f;
+const int   wallMinPWM = 35;
+const int   wallMaxPWM = 255;
 
-  integralAcc = constrain(integralAcc, -maxIntegral, maxIntegral);
+// texture
+const long  texturePeriod = 40;   // counts per full ridge+groove; smaller = finer
 
-  double derivative = error - prevError;
-  double computedPower = (vKp * error) + (vKi * integralAcc) + (vKd * derivative);
+const float settleTolerance = 3.0f;
 
-  return constrain(computedPower, -255.0, 255.0);
-}
+// -------------------------------------------------------- ISR-local state
+// Only ever touched inside the ISR (or under a reset), so no volatile needed.
+float xhPrev = 0.0f;
+float vhPrev = 0.0f;
+float window[WINDOW_N];
+int   windowIdx = 0;
+float wallIntegral = 0.0f;
 
-double calcWallPID(double target, double input) {
-  unsigned long now = millis();
-  double dt = (now - wallLastTime) / 1000.0;
-  if (dt <= 0) dt = 0.01;
-  wallLastTime = now;
+// ============================================================ motor output
+// Called from the ISR. digitalWrite/analogWrite are safe here: neither uses
+// millis() nor re-enables interrupts.
 
-  wallPrevError = wallError;
-  wallError = target - input;
+void setMotor(float command) {
+  int pwmVal = (int)fabs(command);
+  if (pwmVal > 255) pwmVal = 255;
 
-  if (abs(wallError) <= wallSettleTolerance) {
-    wallIntegral = 0;
-    return 0;
-  }
-
-  if (abs(wallError) < 80) {
-    wallIntegral += wallError * dt;
-    wallIntegral = constrain(wallIntegral, -200, 200);
-  } else {
-    wallIntegral = 0;
-  }
-
-  double derivative = (wallError - wallPrevError) / dt;
-
-  double output = (vKp * wallError) + (vKi * wallIntegral) + (vKd * derivative);
-  return constrain(output, -wallMaxPWM, wallMaxPWM);
-}
-
-void brakeMotor() {
-  analogWrite(pwm, 0);
-  digitalWrite(MotIn1, HIGH);
-  digitalWrite(MotIn2, HIGH);
-}
-
-void moveMotor(double motorPower) {
-  int pwmVal = constrain((int)abs(motorPower), 0, 255);
-
-  if (motorPower > 0) {
+  if (command > 0) {
     digitalWrite(MotIn1, HIGH);
     digitalWrite(MotIn2, LOW);
-  } else if (motorPower < 0) {
+  } else if (command < 0) {
     digitalWrite(MotIn1, LOW);
     digitalWrite(MotIn2, HIGH);
   } else {
+    // coast, not brake -- a damper that brakes at v=0 fights you on the way out
     digitalWrite(MotIn1, LOW);
     digitalWrite(MotIn2, LOW);
     pwmVal = 0;
@@ -142,19 +142,20 @@ void moveMotor(double motorPower) {
   analogWrite(pwm, pwmVal);
 }
 
-void moveWallMotor(double motorPower) {
-  if (motorPower == 0) {
-    brakeMotor();
+// Wall modes keep the minimum-PWM stiction breaker from your wall.ino.
+void setWallMotor(float command) {
+  if (command == 0.0f) {
+    analogWrite(pwm, 0);
+    digitalWrite(MotIn1, HIGH);   // brake
+    digitalWrite(MotIn2, HIGH);
     return;
   }
 
-  int pwmVal = constrain(abs(motorPower), 0, wallMaxPWM);
+  int pwmVal = (int)fabs(command);
+  if (pwmVal > wallMaxPWM) pwmVal = wallMaxPWM;
+  if (pwmVal > 0 && pwmVal < wallMinPWM) pwmVal = wallMinPWM;
 
-  if (pwmVal > 0 && pwmVal < wallMinPWM) {
-    pwmVal = wallMinPWM;
-  }
-
-  if (motorPower > 0) {
+  if (command > 0) {
     digitalWrite(MotIn1, HIGH);
     digitalWrite(MotIn2, LOW);
   } else {
@@ -165,97 +166,478 @@ void moveWallMotor(double motorPower) {
   analogWrite(pwm, pwmVal);
 }
 
+// ======================================================= velocity estimate
+// All three methods from the slides. Runs inside the ISR, so dt is exact.
+
+float estimateVelocity(float x) {
+  float v;
+
+  // Method 1: raw differentiation. Noisy enough to be unusable for force
+  // feedback -- included so you can hear/feel exactly how bad it is.
+  float raw = (x - xhPrev) / dt;
+
+  // Method 2: windowed. v = (x[k] - x[k-N]) / (N*dt)
+  float oldest = window[windowIdx];
+  window[windowIdx] = x;
+  windowIdx = (windowIdx + 1) % WINDOW_N;
+  float windowed = (x - oldest) / (WINDOW_N * dt);
+
+  // Method 3: 1st-order low-pass differentiator.
+  float rr = r;                                  // one read of the volatile
+  float lowpass = rr * vhPrev + (1.0f - rr) * raw;
+
+  switch (velMethod) {
+    case VEL_RAW:    v = raw;      break;
+    case VEL_WINDOW: v = windowed; break;
+    default:         v = lowpass;  break;
+  }
+
+  // vhPrev always tracks the low-pass state so the filter stays warm and you
+  // can switch methods mid-run without a transient.
+  vhPrev = lowpass;
+  xhPrev = x;
+  return v;
+}
+
+void resetEstimator(float x) {
+  xhPrev = x;
+  vhPrev = 0.0f;
+  wallIntegral = 0.0f;
+  for (int i = 0; i < WINDOW_N; i++) window[i] = x;
+  windowIdx = 0;
+}
+
+// ==================================================== virtual environments
+// Each returns a motor command in -255..255. Target position is 0 throughout.
+
+float renderSpring(float x) {
+  if (fabs(x) <= settleTolerance) return 0.0f;
+  return -kSpring * x;                                  // F = -k*x
+}
+
+float renderDamper(float v, float b) {
+  return -b * v;                                        // F = -b*xdot
+}
+
+float renderHill(float x, float v) {
+  if (fabs(x) <= settleTolerance) return 0.0f;
+  // Sign is flipped relative to the spring: the hill pushes you away from
+  // center instead of back to it. Your old code did this with moveMotor(-power).
+  //
+  // Note that the flip inverted the derivative term too, so the original was
+  // POSITIVE velocity feedback -- it pumps energy in rather than damping. This
+  // reproduces that on purpose, since it is what you tuned against. If you
+  // actually wanted the hill damped, negate kdHill here.
+  return kHill * x + kdHill * v;
+}
+
+float renderWall(float x, float v, float b) {
+  float error = -x;                                     // target 0
+
+  if (fabs(error) <= wallSettleTolerance) {
+    wallIntegral = 0.0f;
+    return 0.0f;
+  }
+
+  if (fabs(error) < 80.0f) {
+    wallIntegral += error * dt;
+    wallIntegral = constrain(wallIntegral, -200.0f, 200.0f);
+  } else {
+    wallIntegral = 0.0f;
+  }
+
+  // d(error)/dt == -vh exactly, and vh is already filtered -- strictly better
+  // than differencing the error again and much quieter at 1 kHz.
+  float out = wallKp * error + wallKi * wallIntegral + wallKd * (-v) - b * v;
+  return constrain(out, (float)-wallMaxPWM, (float)wallMaxPWM);
+}
+
+// Square-wave texture: alternating bands of damping and free space.
+// Modulus on the integer count is used instead of sin() -- a float sin() call
+// costs on the order of 100 us on a 16 MHz AVR, which is a big bite out of a
+// 1 ms budget. For a smoother-feeling ridge, swap the test for:
+//   bool sticky = sin(PI * x / (texturePeriod / 2.0f)) > 0.0f;
+float renderTexture(long counts, float v, float b) {
+  long m = counts % texturePeriod;
+  if (m < 0) m += texturePeriod;
+  bool sticky = (m < texturePeriod / 2);
+  return sticky ? -b * v : 0.0f;
+}
+
+// ================================================================ haptic ISR
+// Runs every 1 ms. Keep it lean -- no Serial, no millis(), no long math.
+// If this ever takes longer than 1 ms the next interrupt fires inside it and
+// the system falls apart.
+
+ISR(TIMER2_COMPA_vect) {
+  // Encoder::read() re-enables global interrupts before it returns. That is
+  // what lets the encoder ISRs preempt this one, which is what we want -- but
+  // it also means an overrun of the 1 ms budget could re-enter this ISR
+  // (slide 8's "ISR inside the ISR"). This flag makes that a dropped sample
+  // instead of a runaway. The test-and-set happens before the first re-enable,
+  // so it is atomic.
+  static bool inISR = false;
+  if (inISR) return;
+  inISR = true;
+
+  long counts = myEncoder.read();
+  float x = (float)counts;
+
+  if (pendingReset) {
+    resetEstimator(x);
+    pendingReset = false;
+  }
+
+  float v = estimateVelocity(x);
+
+  float av = fabs(v);
+  if (av > vPeak) vPeak = av;
+
+  float b = bDamp;
+  int   m = mode;
+
+  float cmd = 0.0f;
+  bool  wallStyle = false;
+
+  switch (m) {
+    case 0:  cmd = renderSpring(x);                              break;
+    case 1:  cmd = renderWall(x, v, 0.0f);   wallStyle = true;   break;
+    case 2:  cmd = renderHill(x, v);                             break;
+    case 3:  cmd = renderDamper(v, b);                           break;
+    case 4:  cmd = renderSpring(x) + renderDamper(v, b);         break;
+    case 5:  cmd = renderTexture(counts, v, b);                  break;
+    case 6:  cmd = renderWall(x, v, b);      wallStyle = true;   break;
+    default: cmd = 0.0f;                                         break;
+  }
+
+  cmd = constrain(cmd, -255.0f, 255.0f);
+
+  if (wallStyle) setWallMotor(cmd);
+  else           setMotor(cmd);
+
+  encCount = counts;
+  xh       = x;
+  vh       = v;
+  motorCmd = cmd;
+
+  // TCNT2 was reset to 0 by the compare match that started this ISR, so it now
+  // reads how long we have been in here.
+  uint8_t ticks = TCNT2;
+  isrTicks = ticks;
+  if (ticks > isrTicksPeak) isrTicksPeak = ticks;
+
+  inISR = false;
+}
+
+// ================================================================== helpers
+
+// Snapshot the ISR-owned state. These are 4-byte values on an 8-bit CPU, so a
+// read can be torn in half by the ISR. Copy them with interrupts off.
+void readState(long *counts, float *x, float *v, float *cmd) {
+  noInterrupts();
+  *counts = encCount;
+  *x      = xh;
+  *v      = vh;
+  *cmd    = motorCmd;
+  interrupts();
+}
+
+void setMode(int m) {
+  noInterrupts();
+  mode = m;
+  pendingReset = true;
+  isrTicksPeak = 0;   // peak is per-mode; each mode costs a different amount
+  interrupts();
+}
+
+void updateFilterConstant() {
+  float f = fc;
+  float rNew = exp(-2.0f * PI * f * dt);
+  noInterrupts();
+  r = rNew;
+  interrupts();
+}
+
+const char *velMethodName(int m) {
+  switch (m) {
+    case VEL_RAW:    return "raw";
+    case VEL_WINDOW: return "windowed(10ms)";
+    default:         return "low-pass";
+  }
+}
+
+const char *modeName(int m) {
+  switch (m) {
+    case 0:  return "spring";
+    case 1:  return "wall";
+    case 2:  return "hill";
+    case 3:  return "damper";
+    case 4:  return "spring+damper";
+    case 5:  return "texture";
+    case 6:  return "damped wall";
+    default: return "idle";
+  }
+}
+
+void printMenu() {
+  Serial.println();
+  Serial.println(F("--- modes ---"));
+  Serial.println(F("  0 spring        3 damper"));
+  Serial.println(F("  1 wall          4 spring + damper"));
+  Serial.println(F("  2 hill          5 texture"));
+  Serial.println(F("                  6 damped wall"));
+  Serial.println(F("--- tuning ---"));
+  Serial.println(F("  a    auto-tune b  <-- run this first"));
+  Serial.println(F("  [ ]  b  x/div 1.5   (damping)"));
+  Serial.println(F("  - =  fc -/+ 5 Hz    (velocity filter cutoff)"));
+  Serial.println(F("  v    cycle velocity method (raw / windowed / low-pass)"));
+  Serial.println(F("--- other ---"));
+  Serial.println(F("  s  stop     p  pause/resume printing     ?  menu"));
+  Serial.println();
+}
+
+void printStatus() {
+  // ">>" prefix so status lines stand out from the telemetry stream
+  Serial.print(F(">> mode="));   Serial.print(modeName(mode));
+  Serial.print(F("  vel="));  Serial.print(velMethodName(velMethod));
+  Serial.print(F("  b="));    Serial.print(bDamp, 4);   // 4dp: b can land below 0.001
+  Serial.print(F("  fc="));   Serial.print(fc, 1);
+  Serial.print(F("  r="));    Serial.print(r, 4);
+
+  // 250 ticks = the full 1 ms period. Anything approaching that means the ISR
+  // is about to start eating itself.
+  uint8_t peak = isrTicksPeak;
+  Serial.print(F("  ISR peak="));
+  Serial.print(peak * 4);
+  Serial.print(F("us ("));
+  Serial.print((peak * 100) / 250);
+  Serial.println(F("% of 1ms)"));
+}
+
+// --------------------------------------------------------------- auto-tune
+// The units problem: b is PWM per (count/sec), and how many counts/sec a brisk
+// hand movement produces depends on your encoder and pulley ratios. Rather than
+// make you guess, this watches you move the handle for a few seconds, takes the
+// fastest you went, and picks b so that speed maps to a firm-but-not-saturated
+// force. Motor is off while it measures so nothing fights you.
+
+const unsigned long CALIB_MS  = 4000;
+const float         CALIB_PWM = 180.0f;   // target command at your peak speed
+
+bool          calibrating   = false;
+unsigned long calibEnd      = 0;
+int           calibPrevMode = -1;
+unsigned long calibLastTick = 0;
+
+bool printing = true;
+
+void startCalibration() {
+  calibPrevMode = mode;
+
+  setMode(-1);                    // motor off, free to move
+  noInterrupts();
+  vPeak = 0.0f;
+  interrupts();
+
+  calibrating   = true;
+  calibEnd      = millis() + CALIB_MS;
+  calibLastTick = 0;
+
+  Serial.println();
+  Serial.println(F(">> AUTO-TUNE: move the handle back and forth, fast as you"));
+  Serial.println(F(">> plan to move it during the lab. Motor is off."));
+}
+
+void finishCalibration() {
+  calibrating = false;
+
+  noInterrupts();
+  float peak = vPeak;
+  interrupts();
+
+  if (peak < 1.0f) {
+    Serial.println(F(">> AUTO-TUNE: didn't see any movement. b unchanged."));
+  } else {
+    float b = constrain(CALIB_PWM / peak, bMin, bMax);
+    noInterrupts();
+    bDamp = b;
+    interrupts();
+
+    Serial.print(F(">> AUTO-TUNE: peak speed "));
+    Serial.print(peak, 0);
+    Serial.print(F(" counts/s  ->  b = "));
+    Serial.println(b, 4);
+    Serial.println(F(">> Use [ and ] from here. Try mode 3 (damper)."));
+  }
+
+  setMode(calibPrevMode);
+  printStatus();
+}
+
+void handleSerial() {
+  if (Serial.available() <= 0) return;
+  char c = Serial.read();
+
+  // Any key aborts a calibration in progress -- except line endings. The IDE's
+  // Serial Monitor appends a newline by default, so the '\n' chasing the 'a'
+  // that started the calibration would otherwise cancel it instantly.
+  if (calibrating) {
+    if (c == '\r' || c == '\n' || c == ' ') return;
+
+    Serial.println(F(">> AUTO-TUNE: cancelled."));
+    calibrating = false;
+    setMode(calibPrevMode);
+    return;
+  }
+
+  switch (c) {
+    case '0': case '1': case '2': case '3': case '4': case '5': case '6':
+      setMode(c - '0');
+      printStatus();
+      break;
+
+    case 's': case 'S':
+      setMode(-1);
+      printStatus();
+      break;
+
+    case 'v': case 'V':
+      noInterrupts();
+      velMethod = (velMethod + 1) % 3;
+      interrupts();
+      printStatus();
+      break;
+
+    case 'a': case 'A':
+      startCalibration();
+      break;
+
+    case 'p': case 'P':
+      printing = !printing;
+      Serial.println(printing ? F(">> printing on") : F(">> printing off"));
+      break;
+
+    case '[': {
+      float b = constrain(bDamp / bMul, bMin, bMax);
+      noInterrupts(); bDamp = b; interrupts();
+      printStatus();
+      break;
+    }
+    case ']': {
+      float b = constrain(bDamp * bMul, bMin, bMax);
+      noInterrupts(); bDamp = b; interrupts();
+      printStatus();
+      break;
+    }
+
+    case '-': {
+      float f = fc - fcStep;
+      if (f < 1.0f) f = 1.0f;
+      noInterrupts(); fc = f; interrupts();
+      updateFilterConstant();
+      printStatus();
+      break;
+    }
+    case '=': case '+': {
+      float f = fc + fcStep;
+      if (f > 200.0f) f = 200.0f;
+      noInterrupts(); fc = f; interrupts();
+      updateFilterConstant();
+      printStatus();
+      break;
+    }
+
+    case '?':
+      printMenu();
+      printStatus();
+      break;
+
+    case '\r': case '\n': case ' ':
+      break;   // Serial Monitor line endings -- ignore silently
+
+    default:
+      // Anything else was probably a typo. Show the menu instead of
+      // swallowing it, so you never have to remember the keys.
+      Serial.print(F(">> unknown key '"));
+      Serial.print(c);
+      Serial.println(F("'"));
+      printMenu();
+      printStatus();
+      break;
+  }
+}
+
+// ==================================================================== setup
+
 void setup() {
   Serial.begin(115200);
 
   pinMode(MotIn1, OUTPUT);
   pinMode(MotIn2, OUTPUT);
-  pinMode(pwm, OUTPUT);
+  pinMode(pwm,    OUTPUT);
+  setMotor(0);
 
-  wallLastTime = millis();
+  resetEstimator((float)myEncoder.read());
+  updateFilterConstant();
+
+  // --- Timer2 -> 1 kHz haptic ISR ---
+  cli();                        // disable interrupts
+
+  TCCR2A = 0;
+  TCCR2B = 0;
+  TCNT2  = 0;
+
+  TCCR2A |= (1 << WGM21);       // CTC mode: clear timer on compare match
+  TCCR2B |= (1 << CS22);        // prescaler = 64
+  OCR2A   = 249;                // 16,000,000 / (64 * (1 + 249)) = 1000 Hz
+                                // Timer2 is single-slope, so no extra factor of 2
+  TIMSK2 |= (1 << OCIE2A);      // enable compare-match A interrupt
+
+  sei();                        // enable interrupts
 
   printMenu();
+  printStatus();
 }
 
+// ===================================================================== loop
+// Everything slow lives here. The haptic rendering is already happening in the
+// background at 1 kHz whether this loop runs or not.
+
 void loop() {
-  readUserChoice();
+  handleSerial();
 
-  switch (choose) {
-    case 0: // spring
-    {
-      setConstants(4.5, 0.0, 0.0);
+  unsigned long now = millis();
 
-      double targetPosition = 0.0;
-      double currentPosition = myEncoder.read();
+  // --- auto-tune countdown ---
+  if (calibrating) {
+    if ((long)(now - calibEnd) >= 0) {
+      finishCalibration();
+    } else if (now - calibLastTick >= 1000) {
+      calibLastTick = now;
 
-      power = calcPID(targetPosition, currentPosition, 0, 0);
+      noInterrupts();
+      float peak = vPeak;
+      interrupts();
 
-      moveMotor(power);
-
-      Serial.print("Mode: spring");
-      Serial.print(" | Target: ");
-      Serial.print(targetPosition);
-      Serial.print(" | Current: ");
-      Serial.print(currentPosition);
-      Serial.print(" | Power: ");
-      Serial.println(power);
-
-      delay(10);
-      break;
+      Serial.print(F(">> "));
+      Serial.print((calibEnd - now) / 1000 + 1);
+      Serial.print(F("...  peak so far: "));
+      Serial.println(peak, 0);
     }
+    return;                             // no telemetry spam during calibration
+  }
 
-    case 1: // wall, copied from working wall.ino logic
-    {
-      setConstants(5.5, 0.03, 0.18);
+  // --- telemetry ---
+  static unsigned long lastPrint = 0;
+  if (printing && mode >= 0 && now - lastPrint >= 50) {   // 20 Hz
+    lastPrint = now;
 
-      double targetPosition = 0.0;
-      double currentPosition = myEncoder.read();
+    long  counts; float x, v, cmd;
+    readState(&counts, &x, &v, &cmd);
 
-      power = calcWallPID(targetPosition, currentPosition);
-
-      moveWallMotor(power);
-
-      Serial.print("Mode: wall");
-      Serial.print(" | Target: ");
-      Serial.print(targetPosition);
-      Serial.print(" | Current: ");
-      Serial.print(currentPosition);
-      Serial.print(" | Error: ");
-      Serial.print(wallError);
-      Serial.print(" | Power: ");
-      Serial.println(power);
-
-      delay(10);
-      break;
-    }
-
-    case 2: // hill
-    {
-      setConstants(2.0, 0.0, 1.0);
-
-      double targetPosition = 0.0;
-      double currentPosition = myEncoder.read();
-
-      power = calcPID(targetPosition, currentPosition, 0, 0);
-
-      moveMotor(-power);
-
-      Serial.print("Mode: hill");
-      Serial.print(" | Target: ");
-      Serial.print(targetPosition);
-      Serial.print(" | Current: ");
-      Serial.print(currentPosition);
-      Serial.print(" | Power: ");
-      Serial.println(power);
-
-      delay(10);
-      break;
-    }
-
-    default:
-    {
-      moveMotor(0);
-      break;
-    }
+    Serial.print(F("Mode: "));   Serial.print(modeName(mode));
+    Serial.print(F(" | Pos: ")); Serial.print(x, 1);
+    Serial.print(F(" | Vel: ")); Serial.print(v, 1);
+    Serial.print(F(" | Cmd: ")); Serial.println(cmd, 1);
   }
 }
