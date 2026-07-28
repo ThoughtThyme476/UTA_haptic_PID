@@ -1,6 +1,5 @@
-// Testing out the encoder & PID stabilization
-#include <Encoder.h>
 #define ENCODER_OPTIMIZE_INTERRUPTS
+#include <Encoder.h>
 
 const int encA = 2;
 const int encB = 3;
@@ -9,9 +8,6 @@ const int MotIn2 = 4;
 const int pwm = 9;
 
 Encoder myEncoder(encA, encB);
-
-// --- Settle Tolerance Configuration ---
-const double settleTolerance = 3.0; // Stay off if within 5 encoder counts of target
 
 double vKp;
 double vKi;
@@ -22,151 +18,244 @@ double prevError = 0;
 double integralAcc = 0;
 double power = 0;
 
+double wallError = 0;
+double wallPrevError = 0;
+double wallIntegral = 0;
+unsigned long wallLastTime = 0;
 
-int choose = 1;
+const double settleTolerance = 3.0;
 
+const double wallSettleTolerance = 1.0;
+const int wallMinPWM = 35;
+const int wallMaxPWM = 255;
+
+int choose = -1;
 
 void setConstants(double kp, double ki, double kd) {
-    vKp = kp;
-    vKi = ki;
-    vKd = kd;
+  vKp = kp;
+  vKi = ki;
+  vKd = kd;
+}
+
+void printMenu() {
+  Serial.println();
+  Serial.println("Pick a mode:");
+  Serial.println("0 = spring");
+  Serial.println("1 = wall");
+  Serial.println("2 = hill");
+  Serial.println("Type 0, 1, or 2 and press Send.");
+}
+
+void readUserChoice() {
+  if (Serial.available() > 0) {
+    char c = Serial.read();
+
+    if (c == '0' || c == '1' || c == '2') {
+      choose = c - '0';
+
+      error = 0;
+      prevError = 0;
+      integralAcc = 0;
+
+      wallError = 0;
+      wallPrevError = 0;
+      wallIntegral = 0;
+      wallLastTime = millis();
+
+      Serial.print("Now running mode ");
+      Serial.println(choose);
+    }
+  }
 }
 
 double calcPID(double target, double input, double integralKi, double maxIntegral) {
-    prevError = error;
-    error = target - input;
+  prevError = error;
+  error = target - input;
 
-    // Settle tolerance check: turn off power and clear integral if within range
-    if (abs(error) <= settleTolerance) {
-        integralAcc = 0;
-        return 0.0;
-    }
+  if (abs(error) <= settleTolerance) {
+    integralAcc = 0;
+    return 0.0;
+  }
 
-    // Integral calculation
-    if (abs(error) < integralKi) {
-        integralAcc += error;
-    } else {
-        integralAcc = 0; // Reset integral if outside threshold
-    }
-   
-    // Clamp integral
-    integralAcc = constrain(integralAcc, -maxIntegral, maxIntegral);
+  if (abs(error) < integralKi) {
+    integralAcc += error;
+  } else {
+    integralAcc = 0;
+  }
 
-    // Derivative calculation
-    double derivative = error - prevError;
+  integralAcc = constrain(integralAcc, -maxIntegral, maxIntegral);
 
-    // Compute raw PID output
-    double computedPower = (vKp * error) + (vKi * integralAcc) + (vKd * derivative);
+  double derivative = error - prevError;
+  double computedPower = (vKp * error) + (vKi * integralAcc) + (vKd * derivative);
 
-    // Constrain to maximum PWM limits (-255 to 255)
-    return constrain(computedPower, -255.0, 255.0);
+  return constrain(computedPower, -255.0, 255.0);
+}
+
+double calcWallPID(double target, double input) {
+  unsigned long now = millis();
+  double dt = (now - wallLastTime) / 1000.0;
+  if (dt <= 0) dt = 0.01;
+  wallLastTime = now;
+
+  wallPrevError = wallError;
+  wallError = target - input;
+
+  if (abs(wallError) <= wallSettleTolerance) {
+    wallIntegral = 0;
+    return 0;
+  }
+
+  if (abs(wallError) < 80) {
+    wallIntegral += wallError * dt;
+    wallIntegral = constrain(wallIntegral, -200, 200);
+  } else {
+    wallIntegral = 0;
+  }
+
+  double derivative = (wallError - wallPrevError) / dt;
+
+  double output = (vKp * wallError) + (vKi * wallIntegral) + (vKd * derivative);
+  return constrain(output, -wallMaxPWM, wallMaxPWM);
+}
+
+void brakeMotor() {
+  analogWrite(pwm, 0);
+  digitalWrite(MotIn1, HIGH);
+  digitalWrite(MotIn2, HIGH);
 }
 
 void moveMotor(double motorPower) {
-    int pwmVal = constrain((int)abs(motorPower), 0, 255);
+  int pwmVal = constrain((int)abs(motorPower), 0, 255);
 
-    if (motorPower > 0) {
-        // Spin Forward
-        digitalWrite(MotIn1, HIGH);
-        digitalWrite(MotIn2, LOW);
-    } else if (motorPower < 0) {
-        // Spin Backward
-        digitalWrite(MotIn1, LOW);
-        digitalWrite(MotIn2, HIGH);
-    } else {
-        // Stop
-        digitalWrite(MotIn1, LOW);
-        digitalWrite(MotIn2, LOW);
-        pwmVal = 0;
-    }
+  if (motorPower > 0) {
+    digitalWrite(MotIn1, HIGH);
+    digitalWrite(MotIn2, LOW);
+  } else if (motorPower < 0) {
+    digitalWrite(MotIn1, LOW);
+    digitalWrite(MotIn2, HIGH);
+  } else {
+    digitalWrite(MotIn1, LOW);
+    digitalWrite(MotIn2, LOW);
+    pwmVal = 0;
+  }
 
-    analogWrite(pwm, pwmVal);
+  analogWrite(pwm, pwmVal);
+}
+
+void moveWallMotor(double motorPower) {
+  if (motorPower == 0) {
+    brakeMotor();
+    return;
+  }
+
+  int pwmVal = constrain(abs(motorPower), 0, wallMaxPWM);
+
+  if (pwmVal > 0 && pwmVal < wallMinPWM) {
+    pwmVal = wallMinPWM;
+  }
+
+  if (motorPower > 0) {
+    digitalWrite(MotIn1, HIGH);
+    digitalWrite(MotIn2, LOW);
+  } else {
+    digitalWrite(MotIn1, LOW);
+    digitalWrite(MotIn2, HIGH);
+  }
+
+  analogWrite(pwm, pwmVal);
 }
 
 void setup() {
-    Serial.begin(115200);
-    pinMode(MotIn1, OUTPUT);
-    pinMode(MotIn2, OUTPUT);
-    pinMode(pwm, OUTPUT);
-   
-    // NOTE: If the motor runs away at full speed when you test it,
-    // change vKp to a negative value (e.g., -0.5) to reverse the loop direction.
-    // setConstants(20, 0.0, 0.0);
+  Serial.begin(115200);
+
+  pinMode(MotIn1, OUTPUT);
+  pinMode(MotIn2, OUTPUT);
+  pinMode(pwm, OUTPUT);
+
+  wallLastTime = millis();
+
+  printMenu();
 }
 
 void loop() {
+  readUserChoice();
 
-
-switch(choose){
-    case 0: //spring
+  switch (choose) {
+    case 0: // spring
     {
-        setConstants(4.5,0.0,0.0);
-    double targetPosition = 0.0;
-    double currentPosition = myEncoder.read();
+      setConstants(4.5, 0.0, 0.0);
 
-    // Compute PID output
-    power = calcPID(targetPosition, currentPosition, 0, 0);
+      double targetPosition = 0.0;
+      double currentPosition = myEncoder.read();
 
-    // Send the calculated power to the motor
-    moveMotor(power);
+      power = calcPID(targetPosition, currentPosition, 0, 0);
 
-    // Debugging output
-    Serial.print("Target: ");
-    Serial.print(targetPosition);
-    Serial.print(" | Current: ");
-    Serial.print(currentPosition);
-    Serial.print(" | Power: ");
-    Serial.println(power);
+      moveMotor(power);
 
-    delay(10);
-        }
+      Serial.print("Mode: spring");
+      Serial.print(" | Target: ");
+      Serial.print(targetPosition);
+      Serial.print(" | Current: ");
+      Serial.print(currentPosition);
+      Serial.print(" | Power: ");
+      Serial.println(power);
 
-        case 1: //wall
-        {
-            setConstants(20.0,0.0,5.0);
-    double targetPosition = 0.0;
-    double currentPosition = myEncoder.read();
-
-    // Compute PID output
-    power = calcPID(targetPosition, currentPosition, 0, 0);
-
-    // Send the calculated power to the motor
-    moveMotor(power);
-
-    // Debugging output
-    Serial.print("Target: ");
-    Serial.print(targetPosition);
-    Serial.print(" | Current: ");
-    Serial.print(currentPosition);
-    Serial.print(" | Power: ");
-    Serial.println(power);
-
-    delay(10);
-
-        }
-
-         case 2: //hill
-        {
-            setConstants(2.0,0.0,1.0);
-    double targetPosition = 0.0;
-    double currentPosition = myEncoder.read();
-
-    // Compute PID output
-    power = calcPID(targetPosition, currentPosition, 0, 0);
-
-    // Send the calculated power to the motor
-    moveMotor(-power);
-
-    // Debugging output
-    Serial.print("Target: ");
-    Serial.print(targetPosition);
-    Serial.print(" | Current: ");
-    Serial.print(currentPosition);
-    Serial.print(" | Power: ");
-    Serial.println(power);
-
-    delay(10);
-
-        }
+      delay(10);
+      break;
     }
+
+    case 1: // wall, copied from working wall.ino logic
+    {
+      setConstants(5.5, 0.03, 0.18);
+
+      double targetPosition = 0.0;
+      double currentPosition = myEncoder.read();
+
+      power = calcWallPID(targetPosition, currentPosition);
+
+      moveWallMotor(power);
+
+      Serial.print("Mode: wall");
+      Serial.print(" | Target: ");
+      Serial.print(targetPosition);
+      Serial.print(" | Current: ");
+      Serial.print(currentPosition);
+      Serial.print(" | Error: ");
+      Serial.print(wallError);
+      Serial.print(" | Power: ");
+      Serial.println(power);
+
+      delay(10);
+      break;
+    }
+
+    case 2: // hill
+    {
+      setConstants(2.0, 0.0, 1.0);
+
+      double targetPosition = 0.0;
+      double currentPosition = myEncoder.read();
+
+      power = calcPID(targetPosition, currentPosition, 0, 0);
+
+      moveMotor(-power);
+
+      Serial.print("Mode: hill");
+      Serial.print(" | Target: ");
+      Serial.print(targetPosition);
+      Serial.print(" | Current: ");
+      Serial.print(currentPosition);
+      Serial.print(" | Power: ");
+      Serial.println(power);
+
+      delay(10);
+      break;
+    }
+
+    default:
+    {
+      moveMotor(0);
+      break;
+    }
+  }
 }
