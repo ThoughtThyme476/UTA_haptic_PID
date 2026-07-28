@@ -1,0 +1,363 @@
+#include <Encoder.h>
+#define ENCODER_OPTIMIZE_INTERRUPTS
+
+// Hardware Pins
+const int encA = 2;
+const int encB = 3;
+const int MotIn1 = 5;
+const int MotIn2 = 4;
+const int pwm = 9;
+
+Encoder myEncoder(encA, encB);
+
+// --- PID Configuration ---
+const double settleTolerance = 2.0;
+
+double vKp;
+double vKi;
+double vKd;
+
+double error = 0;
+double prevError = 0;
+double integralAcc = 0;
+double power = 0;
+
+int choose = 0;          // 0 = Soft Spring, 1 = Stiff Spring/Wall, 2 = Hill Resistance
+char currentMode = '\0'; // 'P' = Project, 'F' = Flappy Bird, 'T' = Two Player Pong
+
+// --- Game Settings (Shared) ---
+const int SCREEN_HEIGHT = 10;
+const int SCREEN_WIDTH = 30;
+
+// Flappy Bird Variables
+int birdY = 5;
+int pipeX = 25;
+int gapY = 4;
+int gapSize = 3;
+int fbScore = 0;
+bool fbGameOver = false;
+
+// Two-Player Pong Variables
+int p1Y = 4;
+int p2Y = 4;
+const int paddleHeight = 3;
+float ballX = 15.0, ballY = 5.0;
+float ballSpeedX = 1.0, ballSpeedY = 0.5;
+int p1Score = 0;
+int p2Score = 0;
+
+void setConstants(double kp, double ki, double kd) {
+    vKp = kp;
+    vKi = ki;
+    vKd = kd;
+}
+
+double calcPID(double target, double input, double integralKi, double maxIntegral) {
+    prevError = error;
+    error = target - input;
+
+    if (abs(error) <= settleTolerance) {
+        integralAcc = 0;
+        return 0.0;
+    }
+
+    if (abs(error) < integralKi) {
+        integralAcc += error;
+    } else {
+        integralAcc = 0;
+    }
+   
+    integralAcc = constrain(integralAcc, -maxIntegral, maxIntegral);
+    double derivative = error - prevError;
+    double computedPower = (vKp * error) + (vKi * integralAcc) + (vKd * derivative);
+
+    return constrain(computedPower, -255.0, 255.0);
+}
+
+void moveMotor(double motorPower) {
+    int pwmVal = constrain((int)abs(motorPower), 0, 255);
+
+    if (motorPower > 0) {
+        digitalWrite(MotIn1, HIGH);
+        digitalWrite(MotIn2, LOW);
+    } else if (motorPower < 0) {
+        digitalWrite(MotIn1, LOW);
+        digitalWrite(MotIn2, HIGH);
+    } else {
+        digitalWrite(MotIn1, LOW);
+        digitalWrite(MotIn2, LOW);
+        pwmVal = 0;
+    }
+
+    analogWrite(pwm, pwmVal);
+}
+
+// Applies Spring (Case 0/1) or Hill (Case 2) resistance with Virtual Wall boundaries
+double applyHapticResistance(double position, int profileMode) {
+    double computedPower = 0;
+
+    // --- Virtual Haptic Wall Limits (-100 to +100 ticks) ---
+    if (position > 100) {
+        // Upper Wall: Push back inward forcefully
+        setConstants(20.0, 0.0, 5.0);
+        return calcPID(100.0, position, 0, 0);
+    } else if (position < -100) {
+        // Lower Wall: Push forward inward forcefully
+        setConstants(20.0, 0.0, 5.0);
+        return calcPID(-100.0, position, 0, 0);
+    }
+
+    // --- Main Resistance Profiles ---
+    switch(profileMode) {
+        case 0: // Soft Spring
+            setConstants(4.5, 0.0, 0.0);
+            computedPower = calcPID(0.0, position, 0, 0);
+            break;
+
+        case 1: // Stiff Spring
+            setConstants(20.0, 0.0, 5.0);
+            computedPower = calcPID(0.0, position, 0, 0);
+            break;
+
+        case 2: // Hill Resistance (Inverted force pushing over crest)
+            setConstants(2.0, 0.0, 1.0);
+            computedPower = -calcPID(0.0, position, 0, 0);
+            break;
+    }
+
+    return computedPower;
+}
+
+void showMenu() {
+    moveMotor(0);
+    Serial.println("\n\n=================================");
+    Serial.println("       SELECT A MODE/GAME        ");
+    Serial.println("=================================");
+    Serial.println(" Type 'Pr' -> Project PID Mode");
+    Serial.println(" Type 'FB' -> Flappy Bird");
+    Serial.println(" Type 'TP' -> Two-Player Pong");
+    Serial.println("---------------------------------");
+    Serial.println(" Type '0', '1', or '2' anytime to switch profile:");
+    Serial.println("   [0] Soft Spring | [1] Stiff Spring | [2] Hill");
+    Serial.println("---------------------------------");
+    Serial.print("Enter selection: ");
+    
+    currentMode = '\0';
+    
+    while (currentMode == '\0') {
+        if (Serial.available() > 0) {
+            String input = Serial.readStringUntil('\n');
+            input.trim();
+            input.toUpperCase();
+
+            if (input == "PR") {
+                currentMode = 'P';
+                Serial.println("PR\n-> Project Mode Selected!");
+            } else if (input == "FB") {
+                currentMode = 'F';
+                fbScore = 0;
+                pipeX = SCREEN_WIDTH - 1;
+                fbGameOver = false;
+                Serial.println("FB\n-> Flappy Bird Selected!");
+            } else if (input == "TP") {
+                currentMode = 'T';
+                p1Score = 0;
+                p2Score = 0;
+                ballX = 15.0; ballY = 5.0;
+                ballSpeedX = 1.0; ballSpeedY = 0.5;
+                Serial.println("TP\n-> Two-Player Pong Selected!");
+            } else {
+                Serial.println("\nInvalid choice. Type 'Pr', 'FB', or 'TP': ");
+            }
+        }
+    }
+    delay(1000);
+}
+
+void setup() {
+    Serial.begin(115200);
+    pinMode(MotIn1, OUTPUT);
+    pinMode(MotIn2, OUTPUT);
+    pinMode(pwm, OUTPUT);
+
+    showMenu();
+}
+
+// --- PROJECT MODE ---
+void runProjectMode() {
+    double currentPosition = myEncoder.read();
+    
+    // Calculate resistance with active spring/hill profile and boundary walls
+    power = applyHapticResistance(currentPosition, choose);
+    moveMotor(power);
+
+    Serial.print("Profile: ");
+    if (choose == 0) Serial.print("Soft Spring");
+    else if (choose == 1) Serial.print("Stiff Spring");
+    else Serial.print("Hill");
+
+    Serial.print(" | Target: 0.0 | Current: ");
+    Serial.print(currentPosition);
+    Serial.print(" | Power: ");
+    Serial.println(power);
+
+    delay(10);
+}
+
+// --- FLAPPY BIRD MODE ---
+void runFlappyBird() {
+    if (fbGameOver) {
+        Serial.print("\n\n*** GAME OVER *** | Final Score: ");
+        Serial.println(fbScore);
+        Serial.println("Turn encoder back to center (0) to return to menu...");
+        
+        while (abs(myEncoder.read()) > 5) {
+            double resetPower = applyHapticResistance(myEncoder.read(), 0);
+            moveMotor(resetPower);
+            delay(10);
+        }
+        showMenu();
+        return;
+    }
+
+    double currentPosition = myEncoder.read();
+    
+    // Apply selected haptic profile (Spring/Hill) + Wall boundaries
+    power = applyHapticResistance(currentPosition, choose);
+    moveMotor(power);
+
+    birdY = map(constrain((long)currentPosition, -100, 100), -100, 100, 0, SCREEN_HEIGHT - 1);
+
+    pipeX--;
+    if (pipeX < 0) {
+        pipeX = SCREEN_WIDTH - 1;
+        gapY = random(1, SCREEN_HEIGHT - gapSize - 1);
+        fbScore++;
+    }
+
+    if (pipeX == 3) { 
+        if (birdY < gapY || birdY >= gapY + gapSize) {
+            fbGameOver = true;
+        }
+    }
+
+    Serial.println("\n----------------------------------------");
+    for (int y = 0; y < SCREEN_HEIGHT; y++) {
+        String line = "";
+        for (int x = 0; x < SCREEN_WIDTH; x++) {
+            if (x == 3 && y == birdY) line += ">";
+            else if (x == pipeX && (y < gapY || y >= gapY + gapSize)) line += "#";
+            else line += " ";
+        }
+        Serial.println(line);
+    }
+    Serial.print("Score: "); Serial.println(fbScore);
+    delay(120);
+}
+
+// --- TWO-PLAYER PONG MODE ---
+void runPong() {
+    double currentPosition = myEncoder.read();
+
+    // Apply selected haptic profile (Spring/Hill) + Wall boundaries
+    power = applyHapticResistance(currentPosition, choose);
+    moveMotor(power);
+
+    p1Y = map(constrain((long)currentPosition, -100, 100), -100, 100, 0, SCREEN_HEIGHT - paddleHeight);
+
+    // AI Tracking
+    if (ballY > p2Y + 1 && p2Y < SCREEN_HEIGHT - paddleHeight) p2Y++;
+    else if (ballY < p2Y && p2Y > 0) p2Y--;
+
+    // Ball movement
+    ballX += ballSpeedX;
+    ballY += ballSpeedY;
+
+    // Top/Bottom bounce
+    if (ballY <= 0 || ballY >= SCREEN_HEIGHT - 1) {
+        ballSpeedY *= -1;
+    }
+
+    // Paddle collisions
+    if ((int)ballX <= 1 && (int)ballY >= p1Y && (int)ballY < p1Y + paddleHeight) {
+        ballSpeedX = abs(ballSpeedX);
+    }
+    if ((int)ballX >= SCREEN_WIDTH - 2 && (int)ballY >= p2Y && (int)ballY < p2Y + paddleHeight) {
+        ballSpeedX = -abs(ballSpeedX);
+    }
+
+    // Scoring
+    if (ballX < 0) {
+        p2Score++;
+        ballX = 15; ballY = 5;
+        ballSpeedX = 1.0;
+    } else if (ballX >= SCREEN_WIDTH) {
+        p1Score++;
+        ballX = 15; ballY = 5;
+        ballSpeedX = -1.0;
+    }
+
+    if (p1Score >= 5 || p2Score >= 5) {
+        Serial.println("\n\n=================================");
+        if (p1Score >= 5) Serial.println("     PLAYER 1 (YOU) WINS!");
+        else Serial.println("        PLAYER 2 WINS!");
+        Serial.println("=================================");
+        delay(3000);
+        showMenu();
+        return;
+    }
+
+    Serial.println("\n----------------------------------------");
+    for (int y = 0; y < SCREEN_HEIGHT; y++) {
+        String line = "";
+        for (int x = 0; x < SCREEN_WIDTH; x++) {
+            if (x == 0 && y >= p1Y && y < p1Y + paddleHeight) line += "|";
+            else if (x == SCREEN_WIDTH - 1 && y >= p2Y && y < p2Y + paddleHeight) line += "|";
+            else if (x == (int)ballX && y == (int)ballY) line += "O";
+            else line += " ";
+        }
+        Serial.println(line);
+    }
+    Serial.print("P1 (You): "); Serial.print(p1Score);
+    Serial.print("  |  P2 (AI): "); Serial.println(p2Score);
+
+    delay(100);
+}
+
+void loop() {
+    // Check for runtime commands in Serial Monitor
+    if (Serial.available() > 0) {
+        String input = Serial.readStringUntil('\n');
+        input.trim();
+        input.toUpperCase();
+
+        if (input == "M") {
+            showMenu();
+            return;
+        } else if (input == "0") {
+            choose = 0; // Soft Spring
+            Serial.println("\n[Haptics Switched -> Soft Spring]");
+        } else if (input == "1") {
+            choose = 1; // Stiff Spring
+            Serial.println("\n[Haptics Switched -> Stiff Spring]");
+        } else if (input == "2") {
+            choose = 2; // Hill Resistance
+            Serial.println("\n[Haptics Switched -> Hill Resistance]");
+        }
+    }
+
+    switch(currentMode) {
+        case 'P':
+            runProjectMode();
+            break;
+        case 'F':
+            runFlappyBird();
+            break;
+        case 'T':
+            runPong();
+            break;
+        default:
+            showMenu();
+            break;
+    }
+}
