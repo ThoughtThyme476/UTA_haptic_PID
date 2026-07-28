@@ -1,0 +1,344 @@
+#include <Encoder.h>
+#define ENCODER_OPTIMIZE_INTERRUPTS
+
+// Hardware Pins
+const int encA = 2;
+const int encB = 3;
+const int MotIn1 = 5;
+const int MotIn2 = 4;
+const int pwm = 9;
+
+Encoder myEncoder(encA, encB);
+
+// --- PID Configuration ---
+const double settleTolerance = 2.0;
+
+double vKp;
+double vKi;
+double vKd;
+
+double error = 0;
+double prevError = 0;
+double integralAcc = 0;
+double power = 0;
+
+int choose = 1; // Default PID case mode for Project option
+char currentMode = '\0'; // 'P' = Project, 'F' = Flappy Bird, 'T' = Two Player Pong
+
+// --- Game Settings (Shared) ---
+const int SCREEN_HEIGHT = 10;
+const int SCREEN_WIDTH = 30;
+
+// Flappy Bird Variables
+int birdY = 5;
+int pipeX = 25;
+int gapY = 4;
+int gapSize = 3;
+int fbScore = 0;
+bool fbGameOver = false;
+
+// Two-Player Pong Variables
+int p1Y = 4;        // Player 1 Paddle Y (Left)
+int p2Y = 4;        // Player 2 Paddle Y (Right)
+const int paddleHeight = 3;
+float ballX = 15.0, ballY = 5.0;
+float ballSpeedX = 1.0, ballSpeedY = 0.5;
+int p1Score = 0;
+int p2Score = 0;
+
+void setConstants(double kp, double ki, double kd) {
+    vKp = kp;
+    vKi = ki;
+    vKd = kd;
+}
+
+double calcPID(double target, double input, double integralKi, double maxIntegral) {
+    prevError = error;
+    error = target - input;
+
+    if (abs(error) <= settleTolerance) {
+        integralAcc = 0;
+        return 0.0;
+    }
+
+    if (abs(error) < integralKi) {
+        integralAcc += error;
+    } else {
+        integralAcc = 0;
+    }
+   
+    integralAcc = constrain(integralAcc, -maxIntegral, maxIntegral);
+    double derivative = error - prevError;
+    double computedPower = (vKp * error) + (vKi * integralAcc) + (vKd * derivative);
+
+    return constrain(computedPower, -255.0, 255.0);
+}
+
+void moveMotor(double motorPower) {
+    int pwmVal = constrain((int)abs(motorPower), 0, 255);
+
+    if (motorPower > 0) {
+        digitalWrite(MotIn1, HIGH);
+        digitalWrite(MotIn2, LOW);
+    } else if (motorPower < 0) {
+        digitalWrite(MotIn1, LOW);
+        digitalWrite(MotIn2, HIGH);
+    } else {
+        digitalWrite(MotIn1, LOW);
+        digitalWrite(MotIn2, LOW);
+        pwmVal = 0;
+    }
+
+    analogWrite(pwm, pwmVal);
+}
+
+void showMenu() {
+    moveMotor(0); // Ensure motor is off during menu
+    Serial.println("\n\n=================================");
+    Serial.println("       SELECT A MODE/GAME        ");
+    Serial.println("=================================");
+    Serial.println(" Type 'Pr' -> Project PID Mode");
+    Serial.println(" Type 'FB' -> Flappy Bird");
+    Serial.println(" Type 'TP' -> Two-Player Pong");
+    Serial.println("---------------------------------");
+    Serial.print("Enter selection: ");
+    
+    currentMode = '\0'; // Reset
+    
+    // Wait for user input in Serial Monitor
+    while (currentMode == '\0') {
+        if (Serial.available() > 0) {
+            String input = Serial.readStringUntil('\n');
+            input.trim();
+            input.toUpperCase();
+
+            if (input == "PR") {
+                currentMode = 'P';
+                Serial.println("PR\n-> Project Mode Selected!");
+            } else if (input == "FB") {
+                currentMode = 'F';
+                fbScore = 0;
+                pipeX = SCREEN_WIDTH - 1;
+                fbGameOver = false;
+                Serial.println("FB\n-> Flappy Bird Selected!");
+            } else if (input == "TP") {
+                currentMode = 'T';
+                p1Score = 0;
+                p2Score = 0;
+                ballX = 15.0; ballY = 5.0;
+                ballSpeedX = 1.0; ballSpeedY = 0.5;
+                Serial.println("TP\n-> Two-Player Pong Selected!");
+            } else {
+                Serial.println("\nInvalid choice. Type 'Pr', 'FB', or 'TP': ");
+            }
+        }
+    }
+    delay(1000);
+}
+
+void setup() {
+    Serial.begin(115200);
+    pinMode(MotIn1, OUTPUT);
+    pinMode(MotIn2, OUTPUT);
+    pinMode(pwm, OUTPUT);
+
+    showMenu();
+}
+
+// --- GAME MODE 1: PROJECT PID ---
+void runProjectMode() {
+    double targetPosition = 0.0;
+    double currentPosition = myEncoder.read();
+
+    switch(choose) {
+        case 0:
+            setConstants(4.5, 0.0, 0.0);
+            power = calcPID(targetPosition, currentPosition, 0, 0);
+            moveMotor(power);
+            break;
+        case 1:
+            setConstants(20.0, 0.0, 5.0);
+            power = calcPID(targetPosition, currentPosition, 0, 0);
+            moveMotor(power);
+            break;
+        case 2:
+            setConstants(2.0, 0.0, 1.0);
+            power = calcPID(targetPosition, currentPosition, 0, 0);
+            moveMotor(-power);
+            break;
+    }
+
+    Serial.print("Target: ");
+    Serial.print(targetPosition);
+    Serial.print(" | Current: ");
+    Serial.print(currentPosition);
+    Serial.print(" | Power: ");
+    Serial.println(power);
+
+    delay(10);
+}
+
+// --- GAME MODE 2: FLAPPY BIRD ---
+void runFlappyBird() {
+    if (fbGameOver) {
+        Serial.print("\n\n*** GAME OVER *** | Final Score: ");
+        Serial.println(fbScore);
+        Serial.println("Turn encoder back to center (0) to return to menu...");
+        
+        while (abs(myEncoder.read()) > 5) {
+            setConstants(4.5, 0.0, 0.0);
+            double resetPower = calcPID(0.0, myEncoder.read(), 0, 0);
+            moveMotor(resetPower);
+            delay(10);
+        }
+        showMenu();
+        return;
+    }
+
+    double currentPosition = myEncoder.read();
+    setConstants(4.5, 0.0, 0.0); // Case 0 gentle resistance
+    power = calcPID(0.0, currentPosition, 0, 0);
+    moveMotor(power);
+
+    birdY = map(constrain((long)currentPosition, -100, 100), -100, 100, 0, SCREEN_HEIGHT - 1);
+
+    pipeX--;
+    if (pipeX < 0) {
+        pipeX = SCREEN_WIDTH - 1;
+        gapY = random(1, SCREEN_HEIGHT - gapSize - 1);
+        fbScore++;
+    }
+
+    if (pipeX == 3) { 
+        if (birdY < gapY || birdY >= gapY + gapSize) {
+            fbGameOver = true;
+        }
+    }
+
+    Serial.println("\n----------------------------------------");
+    for (int y = 0; y < SCREEN_HEIGHT; y++) {
+        String line = "";
+        for (int x = 0; x < SCREEN_WIDTH; x++) {
+            if (x == 3 && y == birdY) line += ">";
+            else if (x == pipeX && (y < gapY || y >= gapY + gapSize)) line += "#";
+            else line += " ";
+        }
+        Serial.println(line);
+    }
+    Serial.print("Score: "); Serial.println(fbScore);
+    delay(120);
+}
+
+// --- GAME MODE 3: TWO-PLAYER PONG ---
+void runPong() {
+    // 1. Encoder resistance using Case 0
+    double currentPosition = myEncoder.read();
+    setConstants(4.5, 0.0, 0.0);
+    power = calcPID(0.0, currentPosition, 0, 0);
+    moveMotor(power);
+
+    // 2. Map Encoder to Player 1 Paddle Position
+    p1Y = map(constrain((long)currentPosition, -100, 100), -100, 100, 0, SCREEN_HEIGHT - paddleHeight);
+
+    // 3. Simple AI tracking for Player 2 Paddle
+    if (ballY > p2Y + 1 && p2Y < SCREEN_HEIGHT - paddleHeight) p2Y++;
+    else if (ballY < p2Y && p2Y > 0) p2Y--;
+
+    // 4. Update Ball Physics
+    ballX += ballSpeedX;
+    ballY += ballSpeedY;
+
+    // Top/Bottom Wall Collisions
+    if (ballY <= 0 || ballY >= SCREEN_HEIGHT - 1) {
+        ballSpeedY *= -1;
+    }
+
+    // Left Paddle Collision (Player 1)
+    if ((int)ballX <= 1 && (int)ballY >= p1Y && (int)ballY < p1Y + paddleHeight) {
+        ballSpeedX = abs(ballSpeedX); // Bounce Right
+    }
+
+    // Right Paddle Collision (Player 2)
+    if ((int)ballX >= SCREEN_WIDTH - 2 && (int)ballY >= p2Y && (int)ballY < p2Y + paddleHeight) {
+        ballSpeedX = -abs(ballSpeedX); // Bounce Left
+    }
+
+    // Scoring Conditions
+    if (ballX < 0) {
+        p2Score++;
+        ballX = 15; ballY = 5;
+        ballSpeedX = 1.0;
+    } else if (ballX >= SCREEN_WIDTH) {
+        p1Score++;
+        ballX = 15; ballY = 5;
+        ballSpeedX = -1.0;
+    }
+
+    // Win condition check (First to 5 points)
+    if (p1Score >= 5 || p2Score >= 5) {
+        Serial.println("\n\n=================================");
+        if (p1Score >= 5) Serial.println("     PLAYER 1 (YOU) WINS!");
+        else Serial.println("        PLAYER 2 WINS!");
+        Serial.println("=================================");
+        delay(3000);
+        showMenu();
+        return;
+    }
+
+    // 5. Render Pong Frame to Serial Monitor
+    Serial.println("\n----------------------------------------");
+    for (int y = 0; y < SCREEN_HEIGHT; y++) {
+        String line = "";
+        for (int x = 0; x < SCREEN_WIDTH; x++) {
+            // Player 1 Paddle (Left column)
+            if (x == 0 && y >= p1Y && y < p1Y + paddleHeight) {
+                line += "|";
+            }
+            // Player 2 Paddle (Right column)
+            else if (x == SCREEN_WIDTH - 1 && y >= p2Y && y < p2Y + paddleHeight) {
+                line += "|";
+            }
+            // Ball
+            else if (x == (int)ballX && y == (int)ballY) {
+                line += "O";
+            }
+            // Empty space
+            else {
+                line += " ";
+            }
+        }
+        Serial.println(line);
+    }
+    Serial.print("P1 (You): "); Serial.print(p1Score);
+    Serial.print("  |  P2 (AI): "); Serial.println(p2Score);
+
+    delay(100);
+}
+
+void loop() {
+    // Check if user sent 'M' to return to menu from any mode
+    if (Serial.available() > 0) {
+        String input = Serial.readStringUntil('\n');
+        input.trim();
+        input.toUpperCase();
+        if (input == "M") {
+            showMenu();
+            return;
+        }
+    }
+
+    switch(currentMode) {
+        case 'P':
+            runProjectMode();
+            break;
+        case 'F':
+            runFlappyBird();
+            break;
+        case 'T':
+            runPong();
+            break;
+        default:
+            showMenu();
+            break;
+    }
+}
