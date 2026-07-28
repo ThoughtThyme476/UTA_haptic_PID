@@ -1,74 +1,69 @@
-//testing out the encoder
-#include <Encoder.h> //this lets the compiler know we are using the "Encoder" library in this script
-#define ENCODER_OPTIMIZE_INTERRUPTS //lets us use hardware interrupts to stay on top of where encoder is at
+// Testing out the encoder & PID stabilization
+#include <Encoder.h>
+#define ENCODER_OPTIMIZE_INTERRUPTS
+
 const int encA = 2;
 const int encB = 3;
-const int MotIn1 = 5; 
-const int MotIn2 = 4; 
+const int MotIn1 = 5;
+const int MotIn2 = 4;
 const int pwm = 9;
 
-Encoder myEncoder (encA, encB);
-long position = 0; //this will show us the encoder ticks
-const int RadOfRoto = 5;
-const int Radofsect = 75;
-const int AxisofRotoHandle = 85;
-double RotoGet = myEncoder.read();
-float currentPos = RotoGet * (RadOfRoto / AxisofRotoHandle);
+Encoder myEncoder(encA, encB);
 
 // --- Settle Tolerance Configuration ---
-const double settleTolerance = 5.0; // Stay off if within 5 encoder counts of target
+const double settleTolerance = 3.0; // Stay off if within 5 encoder counts of target
 
 double vKp;
 double vKi;
 double vKd;
-float error; //annount from target 
-double prevError;
-int intergral; 
-int derivative;
-int time2 = 0;
-double power;
+
+double error = 0;
+double prevError = 0;
+double integralAcc = 0;
+double power = 0;
 
 
-void setConstants( double kp, double ki, double kd){
+int choose = 1;
+
+
+void setConstants(double kp, double ki, double kd) {
     vKp = kp;
     vKi = ki;
     vKd = kd;
-    }
+}
 
-double calcPID(double target, double input, int integralKi, int maxIntergral){ //basically tuning i here
-    int intergal;
-
+double calcPID(double target, double input, double integralKi, double maxIntegral) {
     prevError = error;
     error = target - input;
 
     // Settle tolerance check: turn off power and clear integral if within range
     if (abs(error) <= settleTolerance) {
-        intergral = 0;
-        power = 0;
-        return power;
+        integralAcc = 0;
+        return 0.0;
     }
 
-    if(abs(error) < integralKi) {
-        intergral += error; 
+    // Integral calculation
+    if (abs(error) < integralKi) {
+        integralAcc += error;
     } else {
-        intergral = 0;
+        integralAcc = 0; // Reset integral if outside threshold
     }
-if(intergral >= 0){
-    intergral = min(intergral, maxIntergral); //min means take whichever value is smaller bwtween intergral and maxI
-} else {
-    intergral = max(intergral, -maxIntergral);//negative max
-}
-    derivative = error - prevError;
+   
+    // Clamp integral
+    integralAcc = constrain(integralAcc, -maxIntegral, maxIntegral);
 
-   power = (vKp * error) + (vKi * intergral) + (vKd * derivative);
+    // Derivative calculation
+    double derivative = error - prevError;
 
+    // Compute raw PID output
+    double computedPower = (vKp * error) + (vKi * integralAcc) + (vKd * derivative);
 
-    return power;
+    // Constrain to maximum PWM limits (-255 to 255)
+    return constrain(computedPower, -255.0, 255.0);
 }
 
 void moveMotor(double motorPower) {
-    // Constrain power to valid PWM range
-    int pwmVal = constrain(abs(motorPower), 0, 255);
+    int pwmVal = constrain((int)abs(motorPower), 0, 255);
 
     if (motorPower > 0) {
         // Spin Forward
@@ -85,38 +80,37 @@ void moveMotor(double motorPower) {
         pwmVal = 0;
     }
 
-    // Send speed to the PWM pin
     analogWrite(pwm, pwmVal);
 }
 
-
-
 void setup() {
-// put your setup code here, to run once:
-Serial.begin(115200); //begin serial communication
-pinMode(MotIn1, OUTPUT); //all caps because it's a predefined constant/macro
-pinMode(MotIn2, OUTPUT);
-pinMode(pwm, OUTPUT);
-setConstants(1,0,0);
+    Serial.begin(115200);
+    pinMode(MotIn1, OUTPUT);
+    pinMode(MotIn2, OUTPUT);
+    pinMode(pwm, OUTPUT);
+   
+    // NOTE: If the motor runs away at full speed when you test it,
+    // change vKp to a negative value (e.g., -0.5) to reverse the loop direction.
+    // setConstants(20, 0.0, 0.0);
 }
 
 void loop() {
-    // 1. Define a target position (for testing, let's say 1000 encoder counts)
-    double targetPosition = 0.0; 
 
-    // 2. Read the current encoder position
+
+switch(choose){
+    case 0: //spring
+    {
+        setConstants(4.5,0.0,0.0);
+    double targetPosition = 0.0;
     double currentPosition = myEncoder.read();
 
-    // 3. Compute PID output (passing target, input, integral threshold, max integral)
-    // Make sure to initialize your constants using setConstants() in setup() first!
-    calcPID(targetPosition, currentPosition, 0, 0);
-   if (power >= 255) power = 255;
-   if (power <= -255) power = -255;
+    // Compute PID output
+    power = calcPID(targetPosition, currentPosition, 0, 0);
 
-    // 4. Send the calculated power to the motor
+    // Send the calculated power to the motor
     moveMotor(power);
 
-    // Optional: Print to Serial Monitor for debugging
+    // Debugging output
     Serial.print("Target: ");
     Serial.print(targetPosition);
     Serial.print(" | Current: ");
@@ -124,6 +118,55 @@ void loop() {
     Serial.print(" | Power: ");
     Serial.println(power);
 
-    // Small delay to keep serial readable (though PID loops prefer consistent timing)
-    delay(10); 
+    delay(10);
+        }
+
+        case 1: //wall
+        {
+            setConstants(20.0,0.0,5.0);
+    double targetPosition = 0.0;
+    double currentPosition = myEncoder.read();
+
+    // Compute PID output
+    power = calcPID(targetPosition, currentPosition, 0, 0);
+
+    // Send the calculated power to the motor
+    moveMotor(power);
+
+    // Debugging output
+    Serial.print("Target: ");
+    Serial.print(targetPosition);
+    Serial.print(" | Current: ");
+    Serial.print(currentPosition);
+    Serial.print(" | Power: ");
+    Serial.println(power);
+
+    delay(10);
+
+        }
+
+         case 2: //hill
+        {
+            setConstants(2.0,0.0,1.0);
+    double targetPosition = 0.0;
+    double currentPosition = myEncoder.read();
+
+    // Compute PID output
+    power = calcPID(targetPosition, currentPosition, 0, 0);
+
+    // Send the calculated power to the motor
+    moveMotor(-power);
+
+    // Debugging output
+    Serial.print("Target: ");
+    Serial.print(targetPosition);
+    Serial.print(" | Current: ");
+    Serial.print(currentPosition);
+    Serial.print(" | Power: ");
+    Serial.println(power);
+
+    delay(10);
+
+        }
+    }
 }
